@@ -1,292 +1,161 @@
-import sqlite3
-import pandas as pd
 import numpy as np
-import talib
-from stable_baselines3 import PPO
-from stable_baselines3.common.env_util import make_vec_env
+import pandas as pd
 import logging
-from datetime import datetime
-import random
-import gym
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
-                    filename='strategy_optimization.log', filemode='a')
-logger = logging.getLogger(__name__)
+from scipy.optimize import minimize
 
 
-class AutoStrategyGenerationOptimization:
-    def __init__(self, db_name="trading_data.db", symbol="EURUSD_i", lookback=60, max_strategies=10):
-        self.db_name = db_name
-        self.symbol = symbol
-        self.lookback = lookback
-        self.max_strategies = max_strategies
-        self.indicators = {
-            "rsi": {"func": talib.RSI, "periods": [14, 21, 28]},
-            "ema": {"func": talib.EMA, "periods": [12, 20, 50]},
-            "macd": {"func": talib.MACD, "params": [(12, 26, 9)]},
-            "bbands": {"func": talib.BBANDS, "periods": [20, 30]}
-        }
-        self.env = make_vec_env(lambda: self.StrategyEnv(self), n_envs=1)
-        self.rl_model = PPO("MlpPolicy", self.env, verbose=0)
-        self.strategy_portfolio = []
-
-    def load_data(self, table_name="historical_data"):
-        conn = sqlite3.connect(self.db_name)
-        df = pd.read_sql_query(f"SELECT * FROM {table_name} WHERE symbol='{self.symbol}'", conn)
-        conn.close()
-        return df
-
-    class StrategyEnv(gym.Env):
-        def __init__(self, outer):
-            super().__init__()
-            self.outer = outer
-            self.df = outer.load_data()
-            self.step_idx = outer.lookback
-            self.position = 0
-            obs_size = sum(
-                len(config["periods"]) if "periods" in config else 1 for config in self.outer.indicators.values())
-            self.action_space = gym.spaces.Discrete(3)
-            self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32)
-
-        def reset(self):
-            self.step_idx = self.outer.lookback
-            self.position = 0
-            return self._get_state()
-
-        def step(self, action):
-            reward = 0
-            if action == 1 and self.position != 1:
-                self.position = 1
-            elif action == 2 and self.position != -1:
-                self.position = -1
-            elif action == 0:
-                self.position = 0
-            next_price = self.df['close'].iloc[self.step_idx]
-            prev_price = self.df['close'].iloc[self.step_idx - 1]
-            if self.position == 1:
-                reward = (next_price - prev_price) * 10
-            elif self.position == -1:
-                reward = (prev_price - next_price) * 10
-            self.step_idx += 1
-            done = self.step_idx >= len(self.df) - 1
-            return self._get_state(), reward, done, {}
-
-        def _get_state(self):
-            df_slice = self.df.iloc[self.step_idx - self.outer.lookback:self.step_idx]
-            state = []
-            for ind_name, ind_config in self.outer.indicators.items():
-                if ind_name == "macd":
-                    macd, signal, hist = ind_config["func"](df_slice['close'], *ind_config["params"][0])
-                    state.append(macd[-1] if not pd.isna(macd[-1]) else 0.0)
-                else:
-                    for period in ind_config["periods"]:
-                        value = ind_config["func"](df_slice['close'], timeperiod=period)
-                        state.append(value.iloc[-1] if not pd.isna(value.iloc[-1]) else 0.0)
-            return np.array(state)
-
-        def seed(self, seed=None):
-            np.random.seed(seed)
-            return [seed]
+class StrategyOptimizer:
+    def __init__(self, data):
+        self.data = data
+        self.logger = logging.getLogger(__name__)
 
     def generate_random_strategy(self):
-        strategy = {"indicators": [], "entry_conditions": [], "exit_conditions": []}
-        for ind_name, ind_config in self.indicators.items():
-            if random.random() > 0.5:
-                if ind_name == "macd":
-                    strategy["indicators"].append((ind_name, ind_config["params"][0]))
-                else:
-                    period = random.choice(ind_config["periods"])
-                    strategy["indicators"].append((ind_name, period))
-        for ind in strategy["indicators"]:
-            if ind[0] == "rsi":
-                strategy["entry_conditions"].append((ind[0], "cross_above", random.uniform(30, 50)))
-                strategy["exit_conditions"].append((ind[0], "cross_below", random.uniform(50, 70)))
-            elif ind[0] == "ema":
-                strategy["entry_conditions"].append((ind[0], "price_above", None))
-                strategy["exit_conditions"].append((ind[0], "price_below", None))
-            elif ind[0] == "macd":
-                strategy["entry_conditions"].append((ind[0], "macd_cross_signal", None))
-                strategy["exit_conditions"].append((ind[0], "signal_cross_macd", None))
-            elif ind[0] == "bbands":
-                strategy["entry_conditions"].append((ind[0], "price_below_lower", None))
-                strategy["exit_conditions"].append((ind[0], "price_above_upper", None))
+        """تولید استراتژی تصادفی با اندیکاتورها و شرایط ورود/خروج"""
+        indicators = [
+            ('rsi', np.random.randint(14, 28)),  # دوره RSI بین 14 تا 28
+            ('ema', np.random.randint(12, 50)),  # دوره EMA بین 12 تا 50
+            ('macd', (12, 26, 9)),  # MACD با تنظیمات ثابت
+            ('bbands', np.random.randint(20, 30))  # دوره Bollinger Bands بین 20 تا 30
+        ]
+        # انتخاب 1 تا 3 اندیکاتور به صورت تصادفی
+        selected_indicators = np.random.choice([0, 1, 2, 3], size=np.random.randint(1, 4), replace=False)
+        strategy = {
+            'indicators': [indicators[i] for i in selected_indicators],
+            'entry_conditions': [],
+            'exit_conditions': []
+        }
+        # اضافه کردن شرایط ورود و خروج برای هر اندیکاتور انتخاب‌شده
+        for ind in strategy['indicators']:
+            if ind[0] == 'rsi':
+                strategy['entry_conditions'].append(('rsi', 'cross_above', np.random.uniform(30, 50)))
+                strategy['exit_conditions'].append(('rsi', 'cross_below', np.random.uniform(50, 70)))
+            elif ind[0] == 'ema':
+                strategy['entry_conditions'].append(('ema', 'price_above', None))
+                strategy['exit_conditions'].append(('ema', 'price_below', None))
+            elif ind[0] == 'macd':
+                strategy['entry_conditions'].append(('macd', 'macd_cross_signal', None))
+                strategy['exit_conditions'].append(('macd', 'signal_cross_macd', None))
+            elif ind[0] == 'bbands':
+                strategy['entry_conditions'].append(('bbands', 'price_below_lower', None))
+                strategy['exit_conditions'].append(('bbands', 'price_above_upper', None))
         return strategy
 
-    def backtest_strategy(self, strategy, df):
-        try:
-            balance = 10000.0
-            position = 0
-            df = df.copy()
+    def calculate_indicators(self, data, indicators):
+        """محاسبه اندیکاتورهای تکنیکال برای داده‌ها"""
+        df = data.copy()
+        for ind in indicators:
+            try:
+                if ind[0] == 'rsi':
+                    df['rsi'] = self._rsi(df['close'], ind[1])
+                elif ind[0] == 'ema':
+                    df['ema'] = df['close'].ewm(span=ind[1], adjust=False).mean()
+                elif ind[0] == 'macd':
+                    ema_fast = df['close'].ewm(span=ind[1][0], adjust=False).mean()
+                    ema_slow = df['close'].ewm(span=ind[1][1], adjust=False).mean()
+                    df['macd'] = ema_fast - ema_slow
+                    df['macd_signal'] = df['macd'].ewm(span=ind[1][2], adjust=False).mean()
+                elif ind[0] == 'bbands':
+                    df['bbands_middle'] = df['close'].rolling(window=ind[1]).mean()
+                    df['bbands_std'] = df['close'].rolling(window=ind[1]).std()
+                    df['bbands_upper'] = df['bbands_middle'] + 2 * df['bbands_std']
+                    df['bbands_lower'] = df['bbands_middle'] - 2 * df['bbands_std']
+            except Exception as e:
+                self.logger.error(f"خطا در محاسبه اندیکاتور {ind[0]}: {str(e)}")
+        return df.dropna()  # حذف ردیف‌هایی که مقادیر NaN دارن
 
-            # اضافه کردن اندیکاتورها به دیتافریم
-            for ind_name, param in strategy["indicators"]:
-                if ind_name == "rsi":
-                    df['rsi'] = talib.RSI(df['close'], timeperiod=param)
-                elif ind_name == "ema":
-                    df[f'ema_{param}'] = talib.EMA(df['close'], timeperiod=param)
-                elif ind_name == "macd":
-                    df['macd'], df['macd_signal'], _ = talib.MACD(df['close'], *param)
-                elif ind_name == "bbands":
-                    df['bb_upper'], df['bb_middle'], df['bb_lower'] = talib.BBANDS(df['close'], timeperiod=param)
-            df = df.dropna()
+    def _rsi(self, prices, period):
+        """محاسبه RSI"""
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
 
-            for i in range(1, len(df)):
-                entry_triggered = False
-                exit_triggered = False
+    def backtest_strategy(self, data, strategy):
+        """بکتست استراتژی با در نظر گرفتن اسپرد"""
+        df = self.calculate_indicators(data, strategy['indicators'])
+        if len(df) < 60:  # حداقل 60 کندل برای تحلیل
+            self.logger.warning(f"تعداد کندل‌ها ({len(df)}) کمتر از 60 است.")
+            return {'balance': 10000.0}  # بالانس اولیه بدون تغییر
 
-                for ind_name, condition, threshold in strategy["entry_conditions"]:
-                    if ind_name == "rsi" and condition == "cross_above":
-                        rsi_curr = df['rsi'].iloc[i]
-                        rsi_prev = df['rsi'].iloc[i - 1]
-                        if rsi_prev < threshold and rsi_curr >= threshold and position == 0:
-                            entry_triggered = True
-                    elif ind_name == "ema" and condition == "price_above":
-                        ema = df[f'ema_{param}'].iloc[i]
-                        price = df['close'].iloc[i]
-                        if price > ema and position == 0:
-                            entry_triggered = True
-                    elif ind_name == "macd" and condition == "macd_cross_signal":
-                        macd_curr = df['macd'].iloc[i]
-                        signal_curr = df['macd_signal'].iloc[i]
-                        macd_prev = df['macd'].iloc[i - 1]
-                        signal_prev = df['macd_signal'].iloc[i - 1]
-                        if macd_prev <= signal_prev and macd_curr > signal_curr and position == 0:
-                            entry_triggered = True
-                    elif ind_name == "bbands" and condition == "price_below_lower":
-                        price = df['close'].iloc[i]
-                        lower = df['bb_lower'].iloc[i]
-                        if price < lower and position == 0:
-                            entry_triggered = True
+        balance = 10000.0
+        position = 0  # 0: بدون پوزیشن، 1: پوزیشن خرید
+        entry_price = 0
+        trades = 0
 
-                for ind_name, condition, threshold in strategy["exit_conditions"]:
-                    if ind_name == "rsi" and condition == "cross_below":
-                        rsi_curr = df['rsi'].iloc[i]
-                        rsi_prev = df['rsi'].iloc[i - 1]
-                        if rsi_prev > threshold and rsi_curr <= threshold and position == 1:
-                            exit_triggered = True
-                    elif ind_name == "ema" and condition == "price_below":
-                        ema = df[f'ema_{param}'].iloc[i]
-                        price = df['close'].iloc[i]
-                        if price < ema and position == 1:
-                            exit_triggered = True
-                    elif ind_name == "macd" and condition == "signal_cross_macd":
-                        macd_curr = df['macd'].iloc[i]
-                        signal_curr = df['macd_signal'].iloc[i]
-                        macd_prev = df['macd'].iloc[i - 1]
-                        signal_prev = df['macd_signal'].iloc[i - 1]
-                        if macd_prev >= signal_prev and macd_curr < signal_curr and position == 1:
-                            exit_triggered = True
-                    elif ind_name == "bbands" and condition == "price_above_upper":
-                        price = df['close'].iloc[i]
-                        upper = df['bb_upper'].iloc[i]
-                        if price > upper and position == 1:
-                            exit_triggered = True
+        for i in range(1, len(df)):
+            entry_signal = True
+            for cond in strategy['entry_conditions']:
+                if cond[0] == 'rsi' and 'rsi' in df.columns:
+                    if not (df['rsi'].iloc[i - 1] < cond[2] and df['rsi'].iloc[i] > cond[2]):
+                        entry_signal = False
+                elif cond[0] == 'ema' and 'ema' in df.columns:
+                    if not (df['close'].iloc[i] > df['ema'].iloc[i]):
+                        entry_signal = False
+                elif cond[0] == 'macd' and 'macd' in df.columns:
+                    if not (df['macd'].iloc[i - 1] < df['macd_signal'].iloc[i - 1] and df['macd'].iloc[i] >
+                            df['macd_signal'].iloc[i]):
+                        entry_signal = False
+                elif cond[0] == 'bbands' and 'bbands_lower' in df.columns:
+                    if not (df['close'].iloc[i] < df['bbands_lower'].iloc[i]):
+                        entry_signal = False
 
-                if entry_triggered:
-                    position = 1
-                    balance -= df['close'].iloc[i]
-                elif exit_triggered:
-                    position = 0
-                    balance += df['close'].iloc[i]
+            exit_signal = True
+            for cond in strategy['exit_conditions']:
+                if cond[0] == 'rsi' and 'rsi' in df.columns:
+                    if not (df['rsi'].iloc[i - 1] > cond[2] and df['rsi'].iloc[i] < cond[2]):
+                        exit_signal = False
+                elif cond[0] == 'ema' and 'ema' in df.columns:
+                    if not (df['close'].iloc[i] < df['ema'].iloc[i]):
+                        exit_signal = False
+                elif cond[0] == 'macd' and 'macd' in df.columns:
+                    if not (df['macd'].iloc[i - 1] > df['macd_signal'].iloc[i - 1] and df['macd'].iloc[i] <
+                            df['macd_signal'].iloc[i]):
+                        exit_signal = False
+                elif cond[0] == 'bbands' and 'bbands_upper' in df.columns:
+                    if not (df['close'].iloc[i] > df['bbands_upper'].iloc[i]):
+                        exit_signal = False
 
-            logger.info(f"نتیجه بکتست استراتژی {strategy}: بالانس {balance}")
-            return {"balance": balance}
-        except Exception as e:
-            logger.error(f"خطا در بکتست استراتژی: {e}")
-            return {"balance": -1}
+            if position == 0 and entry_signal:
+                position = 1
+                entry_price = df['close'].iloc[i]
+                trades += 1
+            elif position == 1 and exit_signal:
+                profit = (df['close'].iloc[i] - entry_price) * 10000  # فرض لات 0.1
+                balance += profit - 0.1  # کسر اسپرد 0.1 پیپ
+                position = 0
 
-    def evaluate_strategy(self, df, strategy):
-        signals = []
-        ind_dict = {ind[0]: ind[1] for ind in strategy["indicators"]}
+        return {'balance': balance, 'trades': trades}
 
-        for ind_name, condition, threshold in strategy["entry_conditions"] + strategy["exit_conditions"]:
-            if ind_name == "rsi" and "rsi" in ind_dict:
-                rsi = talib.RSI(df['close'], timeperiod=ind_dict["rsi"]).iloc[-1]
-                if condition == "cross_above" and rsi > threshold:
-                    signals.append(1 if "entry" in condition else 0)
-                elif condition == "cross_below" and rsi < threshold:
-                    signals.append(-1 if "exit" in condition else 0)
-            elif ind_name == "ema" and "ema" in ind_dict:
-                ema = talib.EMA(df['close'], timeperiod=ind_dict["ema"]).iloc[-1]
-                price = df['close'].iloc[-1]
-                if condition == "price_above" and price > ema:
-                    signals.append(1)
-                elif condition == "price_below" and price < ema:
-                    signals.append(-1)
-            elif ind_name == "macd" and "macd" in ind_dict:
-                macd, signal, _ = talib.MACD(df['close'], *ind_dict["macd"])
-                if condition == "macd_cross_signal" and macd[-1] > signal[-1] and macd[-2] <= signal[-2]:
-                    signals.append(1)
-                elif condition == "signal_cross_macd" and macd[-1] < signal[-1] and macd[-2] >= signal[-2]:
-                    signals.append(-1)
-            elif ind_name == "bbands" and "bbands" in ind_dict:
-                upper, middle, lower = talib.BBANDS(df['close'], timeperiod=ind_dict["bbands"])
-                price = df['close'].iloc[-1]
-                if condition == "price_below_lower" and price < lower[-1]:
-                    signals.append(1)
-                elif condition == "price_above_upper" and price > upper[-1]:
-                    signals.append(-1)
-
-        if any(s == 1 for s in signals):
-            return 1
-        elif any(s == -1 for s in signals):
-            return -1
-        return 0
-
-    def optimize_strategies(self):
-        df = self.load_data()
-        if df.empty or len(df) < self.lookback * 2:
-            logger.warning(f"داده‌های تاریخی کافی نیست (تعداد کندل‌ها: {len(df)})، بهینه‌سازی لغو شد.")
-            return
-
-        strategies = [self.generate_random_strategy() for _ in range(200)]
+    def optimize_strategies(self, num_strategies=50, top_n=10):
+        """بهینه‌سازی استراتژی‌ها و انتخاب بهترین‌ها"""
+        strategies = [self.generate_random_strategy() for _ in range(num_strategies)]
         results = []
         for strategy in strategies:
             try:
-                result = self.backtest_strategy(strategy, df.tail(240))
-                if result["balance"] > 1000:
-                    results.append((strategy, result))
+                result = self.backtest_strategy(self.data, strategy)
+                results.append((strategy, result['balance'], result['trades']))
             except Exception as e:
-                logger.error(f"خطا در بکتست استراتژی: {e}")
+                self.logger.error(f"خطا در بکتست استراتژی: {str(e)}")
+                results.append((strategy, 10000.0, 0))  # در صورت خطا، بالانس اولیه
 
-        if not results:
-            logger.warning("هیچ استراتژی سوددهی پیدا نشد.")
-            default_strategy = {"indicators": [("rsi", 14)], "entry_conditions": [("rsi", "cross_above", 40)],
-                                "exit_conditions": [("rsi", "cross_below", 60)]}
-            self.strategy_portfolio = [default_strategy]
-        else:
-            sorted_results = sorted(results, key=lambda x: x[1]["balance"], reverse=True)
-            self.strategy_portfolio = [strat for strat, res in sorted_results[:self.max_strategies]]
-            try:
-                self.rl_model.learn(total_timesteps=10000)
-            except Exception as e:
-                logger.error(f"خطا در یادگیری PPO: {e}")
-        logger.info(f"پورتفوی استراتژی‌ها به‌روز شد: {len(self.strategy_portfolio)} استراتژی انتخاب شد.")
+        # مرتب‌سازی بر اساس سود و تعداد معاملات (حداقل 5 معامله برای اعتبار)
+        results.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        top_strategies = [r[0] for r in results if r[2] >= 5][:top_n]  # فقط استراتژی‌هایی با حداقل 5 معامله
+        if len(top_strategies) < top_n:
+            self.logger.warning(f"تعداد استراتژی‌های معتبر کمتر از {top_n} است: {len(top_strategies)}")
+            top_strategies.extend([r[0] for r in results[top_n - len(top_strategies):top_n]])
 
-    def get_optimized_signal(self, df):
-        if not self.strategy_portfolio:
-            logger.warning("پورتفوی استراتژی‌ها خالی است، سیگنال پیش‌فرض 0 برگردانده می‌شود.")
-            return 0
-        if df.empty or len(df) < self.lookback:
-            logger.warning(f"داده‌های کافی برای تولید سیگنال وجود ندارد (تعداد کندل‌ها: {len(df)}).")
-            return 0
-
-        signals = [self.evaluate_strategy(df.tail(self.lookback * 2), strategy) for strategy in self.strategy_portfolio]
-        if not signals:
-            logger.warning("هیچ سیگنالی از استراتژی‌ها تولید نشد، سیگنال پیش‌فرض 0 برگردانده می‌شود.")
-            return 0
-
-        return max(set(signals), key=signals.count)
-
-    def run(self):
-        self.optimize_strategies()
-        df = self.load_data("realtime_data")
-        signal = self.get_optimized_signal(df)
-        logger.info(f"سیگنال بهینه‌شده: {signal}")
-        return signal
+        self.logger.info(f"{len(top_strategies)} استراتژی سودده انتخاب شد.")
+        for strat, bal, tr in results[:top_n]:
+            self.logger.info(f"استراتژی: {strat}, بالانس: {bal}, تعداد معاملات: {tr}")
+        return top_strategies
 
 
 if __name__ == "__main__":
-    strategy_module = AutoStrategyGenerationOptimization(symbol="EURUSD_i")
-    signal = strategy_module.run()
-    print(f"سیگنال: {signal}")
+    # تست نمونه
+    logging.basicConfig(level=logging.INFO)
+    data = pd.read_csv("trading_data.csv", index_col='time', parse_dates=True)
+    optimizer = StrategyOptimizer(data)
+    top_strategies = optimizer.optimize_strategies()
+    print("بهترین استراتژی‌ها:", top_strategies)
