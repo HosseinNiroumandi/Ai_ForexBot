@@ -34,9 +34,9 @@ class ContinuousLearningModelUpdating:
         if not mt5.initialize():
             raise ConnectionError("Failed to connect to MetaTrader 5")
 
-        # بارگذاری مدل‌های اولیه از AI Trading Core (فرض بر اینه که این مدل‌ها از قبل ساخته شدن)
+        # بارگذاری مدل‌های اولیه از AI Trading Core
         from ai_trading_core import AITradingCore
-        self.ai_core = AITradingCore(db_name, symbol, lookback)
+        self.ai_core = AITradingCore(db_name, symbol, leverage=10, lookback=lookback)
         self.lstm_models = [clone_model(self.ai_core.lstm_model) for _ in range(ensemble_size)]
         self.transformer_models = [self.ai_core.build_transformer_model() for _ in range(ensemble_size)]
         self.ppo_model = self.ai_core.ppo_model
@@ -50,7 +50,6 @@ class ContinuousLearningModelUpdating:
         }
         self.trade_history = deque(maxlen=1000)  # تاریخچه معاملات
 
-    # --- بارگذاری داده‌های جدید ---
     def load_new_data(self, table_name="realtime_data"):
         conn = sqlite3.connect(self.db_name)
         df = pd.read_sql_query(
@@ -61,7 +60,6 @@ class ContinuousLearningModelUpdating:
             logger.warning(f"جدول {table_name} برای {self.symbol} خالی است یا داده‌ای ندارد.")
         return df
 
-    # --- بارگذاری داده‌های تاریخی ---
     def load_data(self, table_name="historical_data"):
         conn = sqlite3.connect(self.db_name)
         df = pd.read_sql_query(f"SELECT * FROM {table_name} WHERE symbol='{self.symbol}'", conn)
@@ -70,7 +68,6 @@ class ContinuousLearningModelUpdating:
             logger.warning(f"جدول {table_name} برای {self.symbol} خالی است یا داده‌ای ندارد.")
         return df
 
-    # --- به‌روزرسانی آنلاین مدل‌ها ---
     def update_models_online(self, df):
         """
         به‌روزرسانی تدریجی مدل‌های LSTM و Transformer با داده‌های جدید
@@ -96,13 +93,18 @@ class ContinuousLearningModelUpdating:
             logger.warning("داده کافی برای به‌روزرسانی مدل موجود نیست.")
             return
 
-        # به‌روزرسانی LSTM‌ها با بچ‌های کوچک‌تر
-        batch_size = min(16, len(X))  # بچ سایز رو محدود می‌کنیم
+        # چک شکل داده‌ها
+        if X.shape[1:] != (self.lookback, 6):
+            logger.error(f"شکل داده نادرست: انتظار (batch_size, {self.lookback}, 6)، دریافت {X.shape}")
+            return
+
+        # به‌روزرسانی LSTM‌ها
+        batch_size = min(16, len(X))
         for i, model in enumerate(self.lstm_models):
             model.fit(X, y, epochs=1, batch_size=batch_size, verbose=0, shuffle=False)
             logger.info(f"مدل LSTM {i + 1} به‌روز شد.")
-            del X, y  # آزاد کردن حافظه
-            X, y = self.ai_core.prepare_data_for_prediction(df_tech)  # دوباره بارگذاری
+            del X, y
+            X, y = self.ai_core.prepare_data_for_prediction(df_tech)
 
         # به‌روزرسانی Transformer‌ها
         X_torch = torch.tensor(X, dtype=torch.float32)
@@ -111,18 +113,17 @@ class ContinuousLearningModelUpdating:
             optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
             loss_fn = torch.nn.MSELoss()
             optimizer.zero_grad()
-            pred = model(X_torch[:batch_size])  # فقط یه بچ پردازش می‌کنیم
+            pred = model(X_torch[:batch_size])
             loss = loss_fn(pred, y_torch[:batch_size])
             loss.backward()
             optimizer.step()
             logger.info(f"مدل Transformer {i + 1} به‌روز شد.")
 
-        # به‌روزرسانی PPO با تعداد کمتر timesteps
-        self.ppo_model.learn(total_timesteps=500)  # کاهش از 1000 به 500
+        # به‌روزرسانی PPO
+        self.ppo_model.learn(total_timesteps=500)
         logger.info("مدل PPO به‌روز شد.")
-        del X_torch, y_torch  # آزاد کردن حافظه
+        del X_torch, y_torch
 
-    # --- پیش‌بینی با Ensemble ---
     def ensemble_predict(self, df):
         try:
             if len(df) < self.lookback:
@@ -139,21 +140,27 @@ class ContinuousLearningModelUpdating:
                 logger.warning("داده‌های آماده‌شده برای پیش‌بینی خالی است.")
                 return 0
 
+            # چک شکل داده
+            if X.shape[1:] != (self.lookback, 6):
+                logger.error(f"شکل داده نادرست: انتظار (batch_size, {self.lookback}, 6)، دریافت {X.shape}")
+                return 0
+
             # پیش‌بینی با مدل‌های LSTM
             lstm_preds = []
             for model in self.lstm_models:
                 pred = model.predict(X[-1].reshape(1, self.lookback, 6), verbose=0)
-                lstm_preds.append(np.mean(pred.flatten()))  # فلت کردن و میانگین‌گیری
+                lstm_preds.append(np.mean(pred.flatten()))
 
             # پیش‌بینی با مدل‌های Transformer
             X_torch = torch.tensor(X[-1].reshape(1, self.lookback, 6), dtype=torch.float32)
             transformer_preds = []
             for model in self.transformer_models:
                 pred = model(X_torch).detach().numpy()
-                transformer_preds.append(np.mean(pred.flatten()))  # فلت کردن و میانگین‌گیری
+                transformer_preds.append(np.mean(pred.flatten()))
 
             # پیش‌بینی با PPO
-            state = self.ai_core._get_state(df_tech)  # حالا شکل (3,) داره
+            state = X[-1].reshape(1, self.lookback, 6)  # استفاده از داده‌های (60,6)
+            state = self.scaler.fit_transform(state.reshape(-1, 6)).reshape(1, self.lookback, 6)
             ppo_pred = self.ppo_model.predict(state)[0]
 
             # ترکیب پیش‌بینی‌ها
@@ -166,20 +173,16 @@ class ContinuousLearningModelUpdating:
             else:
                 final_pred = 1 if avg_pred > 0.5 else -1 if avg_pred < -0.5 else 0
 
+            logger.info(f"پیش‌بینی نهایی: {final_pred}")
             return final_pred
         except Exception as e:
             logger.error(f"خطا در پیش‌بینی ترکیبی: {e}")
             return 0
 
-    # --- بک‌تست و Forward Testing ---
     def backtest_and_forward_test(self, historical_df, new_df):
         """
         ارزیابی عملکرد مدل با بک‌تست و Forward Testing
-        :param historical_df: داده‌های تاریخی
-        :param new_df: داده‌های جدید
-        :return: معیارهای عملکرد
         """
-        # پردازش دیتا
         historical_df_tech = self.ai_core.technical_analysis(historical_df)
         new_df_tech = self.ai_core.technical_analysis(new_df)
 
@@ -196,7 +199,7 @@ class ContinuousLearningModelUpdating:
             next_price = historical_df_tech['close'].iloc[i]
             prev_price = historical_df_tech['close'].iloc[i - 1]
             profit = (next_price - prev_price) * 10 if signal == 1 else (
-                                                                                    prev_price - next_price) * 10 if signal == -1 else 0
+                prev_price - next_price) * 10 if signal == -1 else 0
             balance += profit
             trades.append(profit)
 
@@ -208,18 +211,16 @@ class ContinuousLearningModelUpdating:
             next_price = new_df_tech['close'].iloc[i]
             prev_price = new_df_tech['close'].iloc[i - 1]
             profit = (next_price - prev_price) * 10 if signal == 1 else (
-                                                                                    prev_price - next_price) * 10 if signal == -1 else 0
+                prev_price - next_price) * 10 if signal == -1 else 0
             forward_trades.append(profit)
 
         # محاسبه معیارها
         self.calculate_performance_metrics(trades + forward_trades)
         return self.performance_metrics
 
-    # --- محاسبه معیارهای عملکرد ---
     def calculate_performance_metrics(self, trades):
         """
         محاسبه معیارهای عملکرد
-        :param trades: لیست سود و ضرر معاملات
         """
         wins = [t for t in trades if t > 0]
         losses = [abs(t) for t in trades if t < 0]
@@ -238,28 +239,25 @@ class ContinuousLearningModelUpdating:
             max_dd = max(max_dd, dd)
         self.performance_metrics["max_drawdown"] = max_dd
 
-        # محاسبه Sharpe Ratio (ساده‌سازی شده)
+        # محاسبه Sharpe Ratio
         returns = np.array(trades)
         self.performance_metrics["sharpe_ratio"] = returns.mean() / returns.std() if returns.std() != 0 else 0
 
         logger.info(f"معیارهای عملکرد: {self.performance_metrics}")
 
-    # --- بهینه‌سازی مدل بر اساس معیارها ---
     def optimize_models(self):
         """
         بهینه‌سازی مدل‌ها بر اساس معیارهای عملکرد
         """
         if self.performance_metrics["win_rate"] < 0.5 or self.performance_metrics["max_drawdown"] > 0.2:
             logger.warning("عملکرد ضعیف تشخیص داده شد، بهینه‌سازی مدل‌ها...")
-            # تنظیم مجدد وزن‌ها یا تغییر هایپرپارامترها
             for model in self.lstm_models:
-                model.compile(optimizer='adam', loss='mse')  # بازنشانی بهینه‌ساز
+                model.compile(optimizer='adam', loss='mse')
             for model in self.transformer_models:
                 for param in model.parameters():
-                    param.data = param.data * 0.95  # کاهش اندک وزن‌ها
-            self.ppo_model = PPO("MlpPolicy", self.ai_core.env, verbose=0)  # بازنشانی PPO
+                    param.data = param.data * 0.95
+            self.ppo_model = PPO("MlpPolicy", self.ai_core.env, verbose=0)
 
-    # --- اجرای کامل ماژول ---
     def run(self):
         try:
             historical_df = self.load_data("historical_data")
@@ -279,21 +277,8 @@ class ContinuousLearningModelUpdating:
             logger.error(f"خطا در اجرای ماژول یادگیری تطبیقی: {str(e)}")
             return {"win_rate": 0, "max_drawdown": 0, "profit_factor": 0, "sharpe_ratio": 0}
 
-            self.update_models_online(data_to_use)
-            historical_df = historical_df.tail(self.lookback * 10)
-            new_df = new_df.tail(self.lookback * 2)
-            metrics = self.backtest_and_forward_test(historical_df, new_df)
-            self.optimize_models()
-            signal = self.ensemble_predict(data_to_use)
-            logger.info(f"سیگنال جدید پس از به‌روزرسانی: {signal}")
-            return metrics
-        except Exception as e:
-            logger.error(f"خطا در اجرای ماژول یادگیری تطبیقی: {e}")
-            return {"win_rate": 0, "max_drawdown": 0, "profit_factor": 0, "sharpe_ratio": 0}
-
 if __name__ == "__main__":
-    # نمونه اجرا
     learning_module = ContinuousLearningModelUpdating(db_name="trading_data.db", symbol="EURUSD_i", lookback=60,
-                                                      ensemble_size=3)
+                                                     ensemble_size=3)
     signal = learning_module.run()
     print(f"سیگنال نهایی: {signal}")
